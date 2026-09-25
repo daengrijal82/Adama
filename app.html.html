@@ -1,0 +1,1045 @@
+/**
+ * ============================================================================
+ * ADAMA - Aplikasi Presensi dan Manajemen Karyawan Modern
+ * File        : app.js
+ * Deskripsi   : Client Frontend Logic untuk GitHub Pages (CORS Fetch Gateway)
+ * Author      : ZettBOT by Zettbos
+ * ============================================================================
+ */
+
+var API_URL = '';
+
+var currentUser = null;
+var currentLatitude = 0;
+var currentLongitude = 0;
+var currentAccuracy = 0;
+var isMockGpsDetected = false;
+var hasClockedInToday = false;
+var currentPageAttendance = 1;
+
+var activeMediaStream = null;
+
+var officeConfig = {
+  latitude: -6.2088,
+  longitude: 106.8456,
+  radius: 500,
+  alamat: ''
+};
+
+var adminMap = null;
+var officeMarker = null;
+var officeCircle = null;
+
+async function callServerApi(action, payload) {
+  var targetUrl = localStorage.getItem('ADAMA_API_ENDPOINT') || API_URL;
+
+  if (!targetUrl || targetUrl.indexOf('http') !== 0) {
+    console.warn('Endpoint API belum diatur. Menggunakan mode simulasi lokal.');
+    return null;
+  }
+
+  try {
+    var response = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify({
+        action: action,
+        payload: payload || {}
+      })
+    });
+
+    var data = await response.json();
+    return data;
+  } catch (err) {
+    console.error('Koneksi Server Gagal:', err);
+    throw err;
+  }
+}
+
+function calculateClientDistance(lat1, lon1, lat2, lon2) {
+  var R = 6371000;
+  var dLat = (lat2 - lat1) * Math.PI / 180;
+  var dLon = (lon2 - lon1) * Math.PI / 180;
+  var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+          Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+          Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
+window.addEventListener('DOMContentLoaded', function() {
+  initDigitalClock();
+  restoreLoginSession();
+  loadOfficeConfigFromServer();
+  initGpsTracking();
+
+  var savedApi = localStorage.getItem('ADAMA_API_ENDPOINT');
+  if (!savedApi && !API_URL) {
+    setTimeout(function() {
+      showToast('Harap atur URL Google Apps Script Anda via tombol API Config', 'info');
+    }, 1200);
+  }
+});
+
+function initDigitalClock() {
+  var days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+  var months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+
+  setInterval(function() {
+    var now = new Date();
+    var hrs = ('0' + now.getHours()).slice(-2);
+    var mins = ('0' + now.getMinutes()).slice(-2);
+    var secs = ('0' + now.getSeconds()).slice(-2);
+    
+    var clockEl = document.getElementById('liveDigitalClock');
+    var dateEl = document.getElementById('liveDigitalDate');
+
+    if (clockEl) clockEl.innerText = hrs + ':' + mins + ':' + secs;
+    if (dateEl) {
+      dateEl.innerText = days[now.getDay()] + ', ' + now.getDate() + ' ' + months[now.getMonth()] + ' ' + now.getFullYear();
+    }
+  }, 1000);
+}
+
+async function loadOfficeConfigFromServer() {
+  try {
+    var res = await callServerApi('getOfficeLocationSettings', {});
+    if (res && res.success && res.config) {
+      officeConfig = res.config;
+      updatePresenceGeofenceStatus();
+      syncInputsFromConfig();
+    } else {
+      syncInputsFromConfig();
+    }
+  } catch (e) {
+    syncInputsFromConfig();
+  }
+}
+
+function initGpsTracking() {
+  var badge = document.getElementById('locationStatusBadge');
+  var label = document.getElementById('locationStatusText');
+
+  if (!navigator.geolocation) {
+    if (label) label.innerText = 'GPS tidak didukung oleh browser';
+    return;
+  }
+
+  navigator.geolocation.watchPosition(
+    function(pos) {
+      currentLatitude = pos.coords.latitude;
+      currentLongitude = pos.coords.longitude;
+      currentAccuracy = pos.coords.accuracy || 0;
+
+      isMockGpsDetected = false;
+      if (pos.coords.isMock === true || pos.mocked === true) isMockGpsDetected = true;
+      if (currentAccuracy === 0) isMockGpsDetected = true;
+
+      var latStr = String(currentLatitude);
+      var lngStr = String(currentLongitude);
+      if (latStr.indexOf('.') === -1 || lngStr.indexOf('.') === -1) isMockGpsDetected = true;
+
+      updatePresenceGeofenceStatus();
+      updateCameraLiveWatermarkText();
+    },
+    function(err) {
+      if (label) label.innerText = 'Izin GPS Wajib Diaktifkan!';
+      if (badge) badge.className = 'location-status-pill out-reach';
+      showToast('Harap izinkan akses GPS untuk presensi valid', 'error');
+    },
+    { enableHighAccuracy: true, maximumAge: 0, timeout: 12000 }
+  );
+}
+
+function updatePresenceGeofenceStatus() {
+  var badge = document.getElementById('locationStatusBadge');
+  var label = document.getElementById('locationStatusText');
+  if (!badge || !label) return;
+
+  if (currentLatitude === 0 && currentLongitude === 0) {
+    label.innerText = 'Menghubungkan ke satelit GPS...';
+    badge.className = 'location-status-pill';
+    return;
+  }
+
+  if (isMockGpsDetected) {
+    badge.className = 'location-status-pill out-reach';
+    label.innerText = 'Peringatan: Terdeteksi Fake GPS / Mock Location!';
+    return;
+  }
+
+  var distance = calculateClientDistance(currentLatitude, currentLongitude, officeConfig.latitude, officeConfig.longitude);
+  
+  if (distance <= officeConfig.radius) {
+    badge.className = 'location-status-pill in-reach';
+    label.innerText = 'Dalam Radius Kantor (' + distance + 'm dari kantor)';
+  } else {
+    badge.className = 'location-status-pill out-reach';
+    label.innerText = 'Di Luar Radius (' + distance + 'm, batas: ' + officeConfig.radius + 'm)';
+  }
+}
+
+function updateCameraLiveWatermarkText() {
+  var previewEl = document.getElementById('liveWatermarkPreview');
+  if (!previewEl) return;
+  var now = new Date();
+  var timeStr = ('0' + now.getHours()).slice(-2) + ':' + ('0' + now.getMinutes()).slice(-2) + ':' + ('0' + now.getSeconds()).slice(-2);
+  var distance = calculateClientDistance(currentLatitude, currentLongitude, officeConfig.latitude, officeConfig.longitude);
+  previewEl.innerText = timeStr + ' WIB | Lat: ' + currentLatitude.toFixed(5) + ', Lng: ' + currentLongitude.toFixed(5) + ' (' + distance + 'm)';
+}
+
+function initAdminMap() {
+  if (adminMap !== null) {
+    setTimeout(function() { adminMap.invalidateSize(); }, 250);
+    return;
+  }
+
+  var lat = officeConfig.latitude || -6.2088;
+  var lng = officeConfig.longitude || 106.8456;
+  var rad = officeConfig.radius || 500;
+
+  adminMap = L.map('adminOfficeMap').setView([lat, lng], 15);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '© OpenStreetMap ADAMA'
+  }).addTo(adminMap);
+
+  officeMarker = L.marker([lat, lng], { draggable: true }).addTo(adminMap);
+  
+  officeCircle = L.circle([lat, lng], {
+    radius: rad,
+    color: '#2B66FE',
+    fillColor: '#2B66FE',
+    fillOpacity: 0.18,
+    weight: 2
+  }).addTo(adminMap);
+
+  officeMarker.on('drag', function(e) {
+    var pos = e.target.getLatLng();
+    officeCircle.setLatLng(pos);
+    updateMapInputs(pos.lat, pos.lng);
+  });
+
+  adminMap.on('click', function(e) {
+    officeMarker.setLatLng(e.latlng);
+    officeCircle.setLatLng(e.latlng);
+    updateMapInputs(e.latlng.lat, e.latlng.lng);
+  });
+
+  setTimeout(function() { adminMap.invalidateSize(); }, 300);
+}
+
+function updateMapInputs(lat, lng) {
+  document.getElementById('mapOfficeLat').value = lat.toFixed(6);
+  document.getElementById('mapOfficeLng').value = lng.toFixed(6);
+}
+
+function syncMapFromInputs() {
+  var lat = parseFloat(document.getElementById('mapOfficeLat').value);
+  var lng = parseFloat(document.getElementById('mapOfficeLng').value);
+  if (!isNaN(lat) && !isNaN(lng) && adminMap && officeMarker && officeCircle) {
+    var newLatLng = new L.LatLng(lat, lng);
+    officeMarker.setLatLng(newLatLng);
+    officeCircle.setLatLng(newLatLng);
+    adminMap.panTo(newLatLng);
+  }
+}
+
+function syncRadiusFromSlider(val) {
+  var r = parseInt(val, 10);
+  document.getElementById('lblRadiusText').innerText = r + ' Meter';
+  if (officeCircle) officeCircle.setRadius(r);
+}
+
+function syncInputsFromConfig() {
+  var latInput = document.getElementById('mapOfficeLat');
+  var lngInput = document.getElementById('mapOfficeLng');
+  var radInput = document.getElementById('mapOfficeRadius');
+  var radLbl = document.getElementById('lblRadiusText');
+  var addrInput = document.getElementById('mapOfficeAddress');
+
+  if (latInput) latInput.value = officeConfig.latitude;
+  if (lngInput) lngInput.value = officeConfig.longitude;
+  if (radInput) radInput.value = officeConfig.radius;
+  if (radLbl) radLbl.innerText = officeConfig.radius + ' Meter';
+  if (addrInput) addrInput.value = officeConfig.alamat || '';
+
+  if (adminMap && officeMarker && officeCircle) {
+    var pos = new L.LatLng(officeConfig.latitude, officeConfig.longitude);
+    officeMarker.setLatLng(pos);
+    officeCircle.setLatLng(pos);
+    officeCircle.setRadius(officeConfig.radius);
+    adminMap.setView(pos, 15);
+  }
+}
+
+function setCurrentGpsAsOffice() {
+  if (currentLatitude === 0 && currentLongitude === 0) {
+    showToast('Menunggu koordinat GPS aktif...', 'error');
+    return;
+  }
+  document.getElementById('mapOfficeLat').value = currentLatitude.toFixed(6);
+  document.getElementById('mapOfficeLng').value = currentLongitude.toFixed(6);
+  syncMapFromInputs();
+  showToast('Titik koordinat GPS Anda diterapkan ke peta', 'success');
+}
+
+async function saveOfficeLocationSettings() {
+  var lat = parseFloat(document.getElementById('mapOfficeLat').value);
+  var lng = parseFloat(document.getElementById('mapOfficeLng').value);
+  var rad = parseInt(document.getElementById('mapOfficeRadius').value, 10);
+  var addr = document.getElementById('mapOfficeAddress').value.trim();
+
+  if (isNaN(lat) || isNaN(lng) || isNaN(rad)) {
+    showToast('Koordinat dan radius tidak valid', 'error');
+    return;
+  }
+
+  var btn = document.getElementById('btnSaveLocation');
+  btn.innerText = 'Menyimpan...';
+  btn.disabled = true;
+
+  var payload = { latitude: lat, longitude: lng, radius: rad, alamat: addr };
+
+  try {
+    var res = await callServerApi('saveOfficeLocationSettings', payload);
+    btn.innerText = 'Simpan Pengaturan Peta';
+    btn.disabled = false;
+    if (res && res.success) {
+      officeConfig = payload;
+      updatePresenceGeofenceStatus();
+      showToast(res.message, 'success');
+    } else {
+      officeConfig = payload;
+      updatePresenceGeofenceStatus();
+      showToast('Tersimpan di sesi lokal (Preview)', 'success');
+    }
+  } catch (err) {
+    btn.innerText = 'Simpan Pengaturan Peta';
+    btn.disabled = false;
+    showToast('Gagal: ' + err.message, 'error');
+  }
+}
+
+function restoreLoginSession() {
+  var saved = localStorage.getItem('ADAMA_USER_SESSION');
+  if (saved) {
+    try {
+      currentUser = JSON.parse(saved);
+      applyUserSession(currentUser);
+    } catch (e) {
+      localStorage.removeItem('ADAMA_USER_SESSION');
+    }
+  }
+}
+
+async function submitLogin() {
+  var u = document.getElementById('loginUsername').value.trim();
+  var p = document.getElementById('loginPassword').value.trim();
+  var btn = document.getElementById('btnLoginSubmit');
+  btn.innerText = 'Memverifikasi...';
+  btn.disabled = true;
+
+  try {
+    var res = await callServerApi('authenticateUser', { username: u, password: p });
+    btn.innerText = 'Masuk ke Sistem';
+    btn.disabled = false;
+
+    if (res && res.success) {
+      currentUser = res.user;
+      localStorage.setItem('ADAMA_USER_SESSION', JSON.stringify(currentUser));
+      applyUserSession(currentUser);
+      showToast('Selamat datang, ' + currentUser.namaLengkap, 'success');
+    } else if (res && !res.success) {
+      showToast(res.message, 'error');
+    } else {
+      currentUser = {
+        userId: 'USR-0001',
+        namaLengkap: 'Budi Pratama (Preview)',
+        username: u || 'preview',
+        role: 'Admin',
+        jabatan: 'Staff Specialist',
+        tipeGaji: 'Bulanan',
+        gajiPokok: 5000000
+      };
+      applyUserSession(currentUser);
+      showToast('Mode Preview Lokal Aktif', 'success');
+    }
+  } catch (err) {
+    btn.innerText = 'Masuk ke Sistem';
+    btn.disabled = false;
+    showToast('Koneksi Gagal: ' + err.message, 'error');
+  }
+}
+
+function applyUserSession(user) {
+  document.getElementById('view-login').classList.remove('active');
+  document.getElementById('topNavHeader').style.display = 'flex';
+  document.getElementById('mainNavigation').style.display = 'flex';
+  document.getElementById('txtUserGreeting').innerText = user.namaLengkap + ' (' + user.role + ')';
+
+  if (user.role === 'Admin') {
+    document.getElementById('navItemAdmin').style.display = 'flex';
+    var btnPay = document.getElementById('btnOpenGeneratePayroll');
+    if (btnPay) btnPay.style.display = 'inline-flex';
+  }
+
+  switchTab('view-presence');
+  fetchDashboardSummary();
+  loadAttendanceHistory(1);
+}
+
+function logoutApp() {
+  localStorage.removeItem('ADAMA_USER_SESSION');
+  currentUser = null;
+  location.reload();
+}
+
+function switchTab(viewId) {
+  var views = document.querySelectorAll('.view-section');
+  for (var i = 0; i < views.length; i++) {
+    views[i].classList.remove('active');
+  }
+  var target = document.getElementById(viewId);
+  if (target) target.classList.add('active');
+
+  var navBtns = document.querySelectorAll('.nav-item');
+  for (var j = 0; j < navBtns.length; j++) {
+    navBtns[j].classList.remove('active');
+  }
+
+  if (viewId === 'view-schedule') loadScheduleData();
+  if (viewId === 'view-leave') loadLeaveData();
+  if (viewId === 'view-payroll') loadPayrollData();
+  if (viewId === 'view-admin') {
+    loadAdminRecap();
+    setTimeout(function() { initAdminMap(); }, 200);
+  }
+}
+
+async function triggerPresenceCamera() {
+  if (currentLatitude === 0 && currentLongitude === 0) {
+    showToast('Menunggu koordinat GPS aktif...', 'error');
+    initGpsTracking();
+    return;
+  }
+
+  if (isMockGpsDetected) {
+    showToast('Presensi ditolak! Terdeteksi indikasi Fake GPS / Mock Location.', 'error');
+    return;
+  }
+
+  var distance = calculateClientDistance(currentLatitude, currentLongitude, officeConfig.latitude, officeConfig.longitude);
+  if (distance > officeConfig.radius) {
+    showToast('Presensi ditolak! Anda berada ' + distance + 'm di luar radius kantor (' + officeConfig.radius + 'm).', 'error');
+    return;
+  }
+
+  var videoEl = document.getElementById('liveCameraStream');
+  var modal = document.getElementById('modalLiveCamera');
+
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    try {
+      modal.classList.add('active');
+      updateCameraLiveWatermarkText();
+
+      activeMediaStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+
+      videoEl.srcObject = activeMediaStream;
+      await videoEl.play();
+    } catch (err) {
+      console.warn('getUserMedia error, beralih ke input native:', err);
+      closeCameraModal();
+      document.getElementById('nativeCameraInput').click();
+    }
+  } else {
+    document.getElementById('nativeCameraInput').click();
+  }
+}
+
+function closeCameraModal() {
+  var modal = document.getElementById('modalLiveCamera');
+  modal.classList.remove('active');
+  if (activeMediaStream) {
+    activeMediaStream.getTracks().forEach(function(track) { track.stop(); });
+    activeMediaStream = null;
+  }
+}
+
+function captureLiveSelfieSnapshot() {
+  var videoEl = document.getElementById('liveCameraStream');
+  if (!videoEl || !activeMediaStream) return;
+
+  var width = videoEl.videoWidth || 640;
+  var height = videoEl.videoHeight || 480;
+
+  var canvas = document.getElementById('selfieCanvasRender');
+  canvas.width = width;
+  canvas.height = height;
+  var ctx = canvas.getContext('2d');
+
+  ctx.save();
+  ctx.translate(width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, 0, 0, width, height);
+  ctx.restore();
+
+  closeCameraModal();
+
+  stampWatermarkOnCanvas(ctx, width, height);
+  var base64Image = canvas.toDataURL('image/jpeg', 0.85);
+  executeAttendanceProcess(base64Image);
+}
+
+function handleNativeSelfieCapture(event) {
+  var files = event.target.files;
+  if (!files || files.length === 0) return;
+
+  var file = files[0];
+  showToast('Memproses foto selfie...', 'info');
+
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var img = new Image();
+    img.onload = function() {
+      var maxDim = 1280;
+      var width = img.width;
+      var height = img.height;
+
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+
+      var canvas = document.getElementById('selfieCanvasRender');
+      canvas.width = width;
+      canvas.height = height;
+      var ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      stampWatermarkOnCanvas(ctx, width, height);
+      var base64 = canvas.toDataURL('image/jpeg', 0.85);
+      executeAttendanceProcess(base64);
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function stampWatermarkOnCanvas(ctx, width, height) {
+  var ribbonHeight = Math.max(90, Math.round(height * 0.18));
+  var fontSizeTitle = Math.max(14, Math.round(width * 0.028));
+  var fontSizeText = Math.max(12, Math.round(width * 0.024));
+
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+  ctx.fillRect(0, height - ribbonHeight, width, ribbonHeight);
+
+  ctx.fillStyle = '#2B66FE';
+  ctx.fillRect(0, height - ribbonHeight, width, 4);
+
+  var now = new Date();
+  var nowFormatted = ('0' + now.getDate()).slice(-2) + '/' +
+                     ('0' + (now.getMonth() + 1)).slice(-2) + '/' +
+                     now.getFullYear() + ' ' +
+                     ('0' + now.getHours()).slice(-2) + ':' +
+                     ('0' + now.getMinutes()).slice(-2) + ':' +
+                     ('0' + now.getSeconds()).slice(-2) + ' WIB';
+
+  var tipe = hasClockedInToday ? 'CLOCK OUT' : 'CLOCK IN';
+  var distance = calculateClientDistance(currentLatitude, currentLongitude, officeConfig.latitude, officeConfig.longitude);
+  var namaUser = currentUser ? (currentUser.namaLengkap + ' (' + currentUser.userId + ')') : 'Karyawan';
+
+  var startX = 20;
+  var startY = height - ribbonHeight + 28;
+
+  ctx.font = 'bold ' + fontSizeTitle + 'px "Plus Jakarta Sans", sans-serif';
+  ctx.fillStyle = '#10B981';
+  ctx.fillText('● ' + tipe + ' VERIFIED', startX, startY);
+
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText(' | ' + namaUser, startX + ctx.measureText('● ' + tipe + ' VERIFIED').width, startY);
+
+  ctx.font = '500 ' + fontSizeText + 'px "Plus Jakarta Sans", sans-serif';
+  ctx.fillStyle = '#E2E8F0';
+  ctx.fillText('WAKTU : ' + nowFormatted, startX, startY + 24);
+
+  var gpsLine = 'LOKASI: ' + currentLatitude.toFixed(6) + ', ' + currentLongitude.toFixed(6) + ' | Jarak: ' + distance + 'm (Radius: ' + officeConfig.radius + 'm)';
+  ctx.fillText(gpsLine, startX, startY + 46);
+
+  ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+  ctx.fillRect(width - 210, 14, 196, 30);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 11px sans-serif';
+  ctx.fillText('ADAMA LIVE AUTHENTICATED', width - 200, 34);
+}
+
+async function executeAttendanceProcess(base64Image) {
+  var tipe = hasClockedInToday ? 'Clock Out' : 'Clock In';
+  
+  var btn = document.getElementById('btnMainPresence');
+  var label = document.getElementById('btnPresenceLabel');
+  label.innerText = 'Menyimpan...';
+
+  var payload = {
+    userId: currentUser.userId,
+    namaLengkap: currentUser.namaLengkap,
+    tipeAbsen: tipe,
+    latitude: currentLatitude,
+    longitude: currentLongitude,
+    accuracy: currentAccuracy,
+    isMock: isMockGpsDetected,
+    base64Image: base64Image,
+    statusShift: 'Normal',
+    keterangan: 'Presensi Kamera Live'
+  };
+
+  try {
+    var res = await callServerApi('recordAttendance', payload);
+    if (res && res.success) {
+      showToast(res.message, 'success');
+      fetchDashboardSummary();
+      loadAttendanceHistory(1);
+    } else if (res && !res.success) {
+      label.innerText = tipe;
+      showToast(res.message, 'error');
+    } else {
+      setTimeout(function() {
+        showToast('Presensi ' + tipe + ' berhasil (Mode Preview)', 'success');
+        if (!hasClockedInToday) {
+          document.getElementById('statClockIn').innerText = '08:05';
+          hasClockedInToday = true;
+          btn.className = 'tap-action-btn clock-out';
+          label.innerText = 'Clock Out';
+        } else {
+          document.getElementById('statClockOut').innerText = '17:02';
+          document.getElementById('statWorkingHours').innerText = '8j 57m';
+          btn.className = 'tap-action-btn';
+          label.innerText = 'Selesai';
+        }
+      }, 500);
+    }
+  } catch (err) {
+    label.innerText = tipe;
+    showToast('Gagal mengirim data: ' + err.message, 'error');
+  }
+}
+
+async function fetchDashboardSummary() {
+  if (!currentUser) return;
+  try {
+    var res = await callServerApi('getTodayAttendanceSummary', { userId: currentUser.userId });
+    if (res && res.success) {
+      document.getElementById('statClockIn').innerText = res.clockIn;
+      document.getElementById('statClockOut').innerText = res.clockOut;
+      document.getElementById('statWorkingHours').innerText = res.workingHours;
+
+      var btn = document.getElementById('btnMainPresence');
+      var label = document.getElementById('btnPresenceLabel');
+      if (res.hasClockIn && !res.hasClockOut) {
+        hasClockedInToday = true;
+        btn.className = 'tap-action-btn clock-out';
+        label.innerText = 'Clock Out';
+      } else if (res.hasClockIn && res.hasClockOut) {
+        hasClockedInToday = false;
+        btn.className = 'tap-action-btn';
+        label.innerText = 'Shift Selesai';
+      } else {
+        hasClockedInToday = false;
+        btn.className = 'tap-action-btn';
+        label.innerText = 'Clock In';
+      }
+    }
+  } catch (e) {}
+}
+
+async function loadAttendanceHistory(page) {
+  if (!currentUser) return;
+  var container = document.getElementById('attendanceHistoryList');
+
+  try {
+    var res = await callServerApi('getAttendanceHistory', {
+      page: page,
+      limit: 10,
+      userId: currentUser.userId,
+      role: currentUser.role
+    });
+
+    if (res && res.success) {
+      renderAttendanceItems(res.items, page > 1);
+      var btnMore = document.getElementById('btnLoadMoreAttendance');
+      if (btnMore) btnMore.style.display = (res.page < res.totalPages) ? 'block' : 'none';
+    } else {
+      var dummyHtml = '<div style="padding:12px 0; border-bottom:1px solid #EFF2F7; display:flex; justify-content:space-between;">' +
+        '<div><b>Clock In - 08:00</b><div style="font-size:0.75rem; color:#8E98B0;">Hari Ini • Dalam Radius Kantor</div></div>' +
+        '<div style="color:#10B981; font-weight:700;">Tepat Waktu</div>' +
+        '</div>';
+      container.innerHTML = dummyHtml;
+    }
+  } catch (e) {}
+}
+
+function renderAttendanceItems(items, append) {
+  var container = document.getElementById('attendanceHistoryList');
+  var html = '';
+  if (!items || items.length === 0) {
+    if (!append) container.innerHTML = '<div style="text-align:center; padding:20px; color:#8E98B0;">Belum ada catatan absensi</div>';
+    return;
+  }
+
+  for (var i = 0; i < items.length; i++) {
+    var itm = items[i];
+    var isClockIn = itm.tipeAbsen === 'Clock In';
+    var badgeColor = isClockIn ? '#2B66FE' : '#FF4D6D';
+
+    html += '<div style="padding:12px 0; border-bottom:1px solid #EFF2F7; display:flex; justify-content:space-between; align-items:center;">';
+    html += '<div>';
+    html += '<div style="font-weight:700; font-size:0.9rem; color:' + badgeColor + ';">' + itm.tipeAbsen + ' - ' + itm.jam + '</div>';
+    html += '<div style="font-size:0.78rem; color:#8E98B0;">' + itm.tanggal + ' • ' + itm.namaKaryawan + ' (' + itm.keterangan + ')</div>';
+    html += '</div>';
+    html += '<div style="text-align:right;">';
+    if (itm.fotoUrl && itm.fotoUrl.indexOf('http') === 0) {
+      html += '<a href="' + itm.fotoUrl + '" target="_blank" style="font-size:0.75rem; color:#2B66FE; text-decoration:none;">Lihat Foto</a>';
+    }
+    html += '</div>';
+    html += '</div>';
+  }
+
+  if (append) {
+    container.innerHTML += html;
+  } else {
+    container.innerHTML = html;
+  }
+}
+
+async function loadScheduleData() {
+  var picker = document.getElementById('scheduleMonthPicker');
+  var now = new Date();
+  if (!picker.value) {
+    var yyyy = now.getFullYear();
+    var mm = ('0' + (now.getMonth() + 1)).slice(-2);
+    picker.value = yyyy + '-' + mm;
+  }
+
+  var monthVal = picker.value;
+  var grid = document.getElementById('calendarGrid');
+  grid.innerHTML = '<div style="grid-column: span 7; padding:20px; color:#8E98B0;">Memuat jadwal shift...</div>';
+
+  try {
+    var res = await callServerApi('getMonthlySchedule', {
+      userId: currentUser.userId,
+      monthYear: monthVal,
+      role: currentUser.role
+    });
+    renderScheduleCalendar(monthVal, (res && res.schedules) ? res.schedules : []);
+  } catch (e) {
+    renderScheduleCalendar(monthVal, []);
+  }
+}
+
+function renderScheduleCalendar(monthYear, scheduleList) {
+  var grid = document.getElementById('calendarGrid');
+  var parts = monthYear.split('-');
+  var year = parseInt(parts[0], 10);
+  var month = parseInt(parts[1], 10) - 1;
+
+  var daysName = ['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'];
+  var html = '';
+
+  for (var d = 0; d < daysName.length; d++) {
+    html += '<div class="cal-header-day">' + daysName[d] + '</div>';
+  }
+
+  var firstDayIndex = new Date(year, month, 1).getDay();
+  var totalDays = new Date(year, month + 1, 0).getDate();
+
+  for (var b = 0; b < firstDayIndex; b++) {
+    html += '<div></div>';
+  }
+
+  for (var day = 1; day <= totalDays; day++) {
+    var dayStr = ('0' + day).slice(-2);
+    var dateFull = monthYear + '-' + dayStr;
+    
+    var shiftBadge = '';
+    for (var s = 0; s < scheduleList.length; s++) {
+      if (scheduleList[s].tanggal === dateFull) {
+        var sName = scheduleList[s].namaShift;
+        var badgeCls = 'badge-m';
+        var code = 'M';
+        if (sName.indexOf('Siang') !== -1) { badgeCls = 'badge-l'; code = 'L'; }
+        if (sName.indexOf('Malam') !== -1) { badgeCls = 'badge-n'; code = 'N'; }
+        shiftBadge = '<span class="badge-shift-pill ' + badgeCls + '">' + code + '</span>';
+        break;
+      }
+    }
+
+    html += '<div class="cal-day-cell">';
+    html += '<span class="num">' + day + '</span>';
+    html += shiftBadge;
+    html += '</div>';
+  }
+
+  grid.innerHTML = html;
+}
+
+function openLeaveModal() {
+  document.getElementById('modalLeave').classList.add('active');
+}
+
+function submitLeaveForm() {
+  var jenis = document.getElementById('leaveType').value;
+  var start = document.getElementById('leaveStartDate').value;
+  var end = document.getElementById('leaveEndDate').value;
+  var alasan = document.getElementById('leaveReason').value;
+  var fileInput = document.getElementById('leaveFileInput');
+
+  if (!start || !end || !alasan) {
+    showToast('Lengkapi semua kolom formulir!', 'error');
+    return;
+  }
+
+  var btn = document.getElementById('btnSubmitLeave');
+  btn.innerText = 'Mengirim...';
+  btn.disabled = true;
+
+  var sendData = async function(base64File) {
+    var payload = {
+      userId: currentUser.userId,
+      namaKaryawan: currentUser.namaLengkap,
+      jenisPengajuan: jenis,
+      tanggalMulai: start,
+      tanggalSelesai: end,
+      jumlahHari: 1,
+      alasan: alasan,
+      base64File: base64File || ''
+    };
+
+    try {
+      var res = await callServerApi('submitLeaveRequest', payload);
+      btn.innerText = 'Kirim Pengajuan';
+      btn.disabled = false;
+      if (res && res.success) {
+        closeModal('modalLeave');
+        showToast(res.message, 'success');
+        loadLeaveData();
+      } else {
+        closeModal('modalLeave');
+        showToast('Pengajuan cuti terkirim (Preview)', 'success');
+      }
+    } catch (e) {
+      btn.innerText = 'Kirim Pengajuan';
+      btn.disabled = false;
+      showToast('Gagal: ' + e.message, 'error');
+    }
+  };
+
+  if (fileInput.files.length > 0) {
+    var reader = new FileReader();
+    reader.onload = function(e) { sendData(e.target.result); };
+    reader.readAsDataURL(fileInput.files[0]);
+  } else {
+    sendData('');
+  }
+}
+
+async function loadLeaveData() {
+  var container = document.getElementById('leaveRequestList');
+  try {
+    var res = await callServerApi('getLeaveRequests', { userId: currentUser.userId, role: currentUser.role });
+    renderLeaveItems((res && res.items) ? res.items : []);
+  } catch (e) {}
+}
+
+function renderLeaveItems(items) {
+  var container = document.getElementById('leaveRequestList');
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div style="text-align:center; padding:20px; color:#8E98B0;">Belum ada pengajuan izin/cuti</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < items.length; i++) {
+    var itm = items[i];
+    var statusColor = '#F59E0B';
+    if (itm.status === 'Disetujui') statusColor = '#10B981';
+    if (itm.status === 'Ditolak') statusColor = '#FF4D6D';
+
+    html += '<div style="padding:14px; border:1px solid #EFF2F7; border-radius:14px; margin-bottom:10px;">';
+    html += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">';
+    html += '<span style="font-weight:700; color:#1A2138;">' + itm.jenis + ' (' + itm.namaKaryawan + ')</span>';
+    html += '<span style="background:' + statusColor + '20; color:' + statusColor + '; font-size:0.75rem; font-weight:700; padding:4px 8px; border-radius:6px;">' + itm.status + '</span>';
+    html += '</div>';
+    html += '<div style="font-size:0.8rem; color:#8E98B0;">Periode: ' + itm.tanggalMulai + ' s/d ' + itm.tanggalSelesai + '</div>';
+    html += '<div style="font-size:0.85rem; margin-top:6px;">' + itm.alasan + '</div>';
+
+    if (currentUser.role === 'Admin' && itm.status === 'Menunggu') {
+      html += '<div style="margin-top:10px; display:flex; gap:8px;">';
+      html += '<button class="btn-primary" style="padding:6px 12px; font-size:0.75rem;" onclick="processApproval(\'' + itm.idPengajuan + '\', \'Disetujui\')">Setujui</button>';
+      html += '<button class="btn-outline" style="padding:6px 12px; font-size:0.75rem; color:#FF4D6D;" onclick="processApproval(\'' + itm.idPengajuan + '\', \'Ditolak\')">Tolak</button>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  container.innerHTML = html;
+}
+
+async function processApproval(idPengajuan, status) {
+  try {
+    var res = await callServerApi('updateLeaveApproval', { idPengajuan: idPengajuan, statusApproval: status, catatanAdmin: 'Diproses Admin' });
+    if (res && res.success) {
+      showToast(res.message, 'success');
+      loadLeaveData();
+    }
+  } catch (e) {}
+}
+
+async function loadPayrollData() {
+  try {
+    var res = await callServerApi('getPayrollList', { userId: currentUser.userId, role: currentUser.role });
+    renderPayrollItems((res && res.items) ? res.items : []);
+  } catch (e) {}
+}
+
+function renderPayrollItems(items) {
+  var container = document.getElementById('payrollHistoryList');
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div style="text-align:center; padding:20px; color:#8E98B0;">Belum ada slip gaji yang dibuat</div>';
+    return;
+  }
+
+  var html = '';
+  for (var i = 0; i < items.length; i++) {
+    var itm = items[i];
+    html += '<div style="padding:14px; border:1px solid #EFF2F7; border-radius:14px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">';
+    html += '<div>';
+    html += '<div style="font-weight:700;">Periode: ' + itm.periodeBulan + '</div>';
+    html += '<div style="font-size:0.8rem; color:#8E98B0;">' + itm.namaKaryawan + ' • ' + itm.tipeGaji + '</div>';
+    html += '<div style="font-weight:800; color:#2B66FE; margin-top:4px;">Rp ' + Number(itm.totalGajiBersih).toLocaleString('id-ID') + '</div>';
+    html += '</div>';
+    html += '<div>';
+    html += '<button class="btn-primary" style="padding:6px 12px; font-size:0.8rem;" onclick="viewThermalSlip(' + JSON.stringify(itm).replace(/"/g, '&quot;') + ')">Struk Thermal</button>';
+    html += '</div>';
+    html += '</div>';
+  }
+  container.innerHTML = html;
+}
+
+function viewThermalSlip(payrollObj) {
+  document.getElementById('rcpId').innerText = payrollObj.idPayroll;
+  document.getElementById('rcpNama').innerText = payrollObj.namaKaryawan;
+  document.getElementById('rcpPeriode').innerText = 'Periode: ' + payrollObj.periodeBulan;
+  document.getElementById('rcpTipe').innerText = payrollObj.tipeGaji;
+  document.getElementById('rcpGajiPokok').innerText = 'Rp ' + Number(payrollObj.gajiDasar).toLocaleString('id-ID');
+  document.getElementById('rcpTotalTambahan').innerText = '+ Rp ' + Number(payrollObj.totalTambahan).toLocaleString('id-ID');
+  document.getElementById('rcpTotalPotongan').innerText = '- Rp ' + Number(payrollObj.totalPotongan).toLocaleString('id-ID');
+  document.getElementById('rcpNetTotal').innerText = 'Rp ' + Number(payrollObj.totalGajiBersih).toLocaleString('id-ID');
+
+  document.getElementById('modalThermalSlip').classList.add('active');
+}
+
+function setThermalSize(size) {
+  var rcp = document.getElementById('receiptContainer');
+  var b58 = document.getElementById('btnSize58');
+  var b80 = document.getElementById('btnSize80');
+
+  if (size === '58') {
+    rcp.className = 'receipt-container receipt-58';
+    b58.className = 'btn-primary';
+    b80.className = 'btn-outline';
+  } else {
+    rcp.className = 'receipt-container receipt-80';
+    b80.className = 'btn-primary';
+    b58.className = 'btn-outline';
+  }
+}
+
+async function loadAdminRecap() {
+  var start = document.getElementById('recapStartDate').value;
+  var end = document.getElementById('recapEndDate').value;
+
+  try {
+    var res = await callServerApi('getAttendanceHistory', { page: 1, limit: 50, startDate: start, endDate: end, role: 'Admin' });
+    if (res && res.success) {
+      document.getElementById('adminTotalHadir').innerText = res.summary.hadir;
+      document.getElementById('adminTotalTelat').innerText = res.summary.telat;
+      renderAdminTable(res.items);
+    }
+  } catch (e) {}
+}
+
+function renderAdminTable(items) {
+  var container = document.getElementById('adminRecapTableContainer');
+  if (!items || items.length === 0) {
+    container.innerHTML = '<div style="text-align:center; padding:20px; color:#8E98B0;">Tidak ada rekaman absensi pada filter ini.</div>';
+    return;
+  }
+
+  var html = '<div style="overflow-x:auto;"><table style="width:100%; border-collapse:collapse; font-size:0.85rem; text-align:left;">';
+  html += '<thead style="background:#F4F7FC; color:#8E98B0;"><tr>';
+  html += '<th style="padding:10px;">ID</th><th style="padding:10px;">Nama</th><th style="padding:10px;">Tanggal</th><th style="padding:10px;">Tipe</th><th style="padding:10px;">Jam</th><th style="padding:10px;">Lokasi</th>';
+  html += '</tr></thead><tbody>';
+
+  for (var i = 0; i < items.length; i++) {
+    var itm = items[i];
+    html += '<tr style="border-bottom:1px solid #EFF2F7;">';
+    html += '<td style="padding:10px;">' + itm.idAbsensi + '</td>';
+    html += '<td style="padding:10px; font-weight:600;">' + itm.namaKaryawan + '</td>';
+    html += '<td style="padding:10px;">' + itm.tanggal + '</td>';
+    html += '<td style="padding:10px;">' + itm.tipeAbsen + '</td>';
+    html += '<td style="padding:10px;">' + itm.jam + '</td>';
+    html += '<td style="padding:10px;"><a href="' + itm.lokasiMaps + '" target="_blank" style="color:#2B66FE; text-decoration:none;">Lihat Peta</a></td>';
+    html += '</tr>';
+  }
+
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function openApiConfigModal() {
+  var input = document.getElementById('inputApiEndpoint');
+  input.value = localStorage.getItem('ADAMA_API_ENDPOINT') || API_URL || '';
+  document.getElementById('modalApiConfig').classList.add('active');
+}
+
+function saveApiEndpointSetting() {
+  var val = document.getElementById('inputApiEndpoint').value.trim();
+  if (!val) {
+    localStorage.removeItem('ADAMA_API_ENDPOINT');
+    showToast('Endpoint dikosongkan (Mode Preview)', 'info');
+  } else {
+    localStorage.setItem('ADAMA_API_ENDPOINT', val);
+    showToast('Endpoint API Apps Script berhasil disimpan!', 'success');
+  }
+  closeModal('modalApiConfig');
+  loadOfficeConfigFromServer();
+}
+
+function closeModal(id) {
+  var el = document.getElementById(id);
+  if (el) el.classList.remove('active');
+}
+
+function showToast(msg, type) {
+  var container = document.getElementById('toastContainer');
+  var toast = document.createElement('div');
+  toast.className = 'toast-msg ' + (type || '');
+  toast.innerText = msg;
+  container.appendChild(toast);
+  setTimeout(function() {
+    toast.remove();
+  }, 3500);
+}
